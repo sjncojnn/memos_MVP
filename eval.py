@@ -104,15 +104,16 @@ def run_eval(golden_csv: str, qa: QAService, use_llm_judge: bool = True,
 
 if __name__ == "__main__":
     import argparse
-    from ollama_client import OllamaClient
+    import client_factory
 
     ap = argparse.ArgumentParser()
     ap.add_argument("golden_csv")
     ap.add_argument("--no-judge", action="store_true")
     ap.add_argument("--out", default="eval_results.csv")
+    ap.add_argument("--backend", choices=list(client_factory.BACKENDS), default=None)
     args = ap.parse_args()
 
-    qa = QAService(OllamaClient())
+    qa = QAService(client_factory.get_client(backend=args.backend))
     summary = run_eval(args.golden_csv, qa, use_llm_judge=not args.no_judge, out_csv=args.out)
     for k, v in summary.items():
         print(f"{k}: {v}")

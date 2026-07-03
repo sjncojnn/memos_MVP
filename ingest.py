@@ -175,7 +175,7 @@ def parse_faq_xlsx(path: Path, question_col: str = None, answer_col: str = None)
 # ---------------------------------------------------------------- orchestration
 def ingest_docx_folder(folder: Path, store: MemoryStore, ttl_days: int = None) -> dict:
     folder = Path(folder)
-    summary = {"files": 0, "inserted": 0, "exact_dup_skipped": 0, "near_dup_superseded": 0, "errors": []}
+    summary = {"files": 0, "inserted": 0, "exact_dup_skipped": 0, "near_dup_conflict": 0, "errors": []}
     for path in sorted(folder.glob("*.docx")):
         summary["files"] += 1
         category = guess_category(path.name)
@@ -195,7 +195,7 @@ def ingest_docx_folder(folder: Path, store: MemoryStore, ttl_days: int = None) -
 
 def ingest_faq_xlsx(path: Path, store: MemoryStore, ttl_days: int = None) -> dict:
     path = Path(path)
-    summary = {"files": 1, "inserted": 0, "exact_dup_skipped": 0, "near_dup_superseded": 0, "errors": []}
+    summary = {"files": 1, "inserted": 0, "exact_dup_skipped": 0, "near_dup_conflict": 0, "errors": []}
     try:
         items = parse_faq_xlsx(path)
     except Exception as e:  # noqa: BLE001

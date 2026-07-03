@@ -61,14 +61,25 @@ class QAService:
                 conn.execute("UPDATE qa_cache SET hits=hits+1, last_hit_at=? WHERE id=?",
                              (_now(), cache_id))
 
-    def _store_cache(self, question: str, q_vec, answer: str, source_ids: list[str]):
+    def _store_cache(self, question: str, q_vec, answer: str, sources_meta: list[dict]):
         with db.get_conn() as conn:
             conn.execute(
                 "INSERT INTO qa_cache (id, question_norm, question_embedding, answer, source_ids, "
                 "hits, is_stable, created_at, last_hit_at) VALUES (?,?,?,?,?,?,?,?,?)",
                 (str(uuid.uuid4()), _normalize_q(question), vs.encode_embedding(q_vec), answer,
-                 json.dumps(source_ids), 1, 0, _now(), _now())
+                 json.dumps(sources_meta), 1, 0, _now(), _now())
             )
+
+    def cache_info(self, question: str) -> dict | None:
+        """Đọc trạng thái cache hiện tại (hits, is_stable) của 1 câu hỏi theo dạng chuẩn hoá
+        chính xác (không qua similarity) — dùng cho tab demo 'Repeated Question' để hiển thị
+        tiến trình tới STABLE_CACHE_MIN_HITS."""
+        qn = _normalize_q(question)
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT hits, is_stable, last_hit_at FROM qa_cache WHERE question_norm=?", (qn,)
+            ).fetchone()
+            return dict(row) if row else None
 
     # ------------------------------------------------------------ main
     def answer(self, question: str, top_k: int = None) -> dict:
@@ -100,21 +111,27 @@ class QAService:
         answer_text = gen["answer"]
         latency = gen["latency_sec"]
 
-        source_ids = [r["id"] for r in results]
+        # Định dạng sources THỐNG NHẤT dù trả lời từ cache hay từ LLM mới -> dùng chung cho
+        # UI (Batch Questions, Memory/Conflict Monitor) suy ra tier_used/nguồn mà không cần
+        # phân biệt 2 nhánh.
+        sources_meta = [
+            {"id": r["id"], "source_file": r["source_file"], "source_ref": r["source_ref"],
+             "tier": r.get("tier"), "similarity": r.get("similarity")}
+            for r in results
+        ]
         if cache:
             # câu hỏi gần giống 1 câu đã hỏi trước nhưng chưa "stable" -> cộng dồn hits,
             # dùng lại answer mới nhất để cache luôn cập nhật theo tri thức mới nhất
             self._touch_cache(cache["row"]["id"], promote_stable=True)
             with db.get_conn() as conn:
                 conn.execute("UPDATE qa_cache SET answer=?, source_ids=? WHERE id=?",
-                             (answer_text, json.dumps(source_ids), cache["row"]["id"]))
+                             (answer_text, json.dumps(sources_meta), cache["row"]["id"]))
         else:
-            self._store_cache(question, q_vec, answer_text, source_ids)
+            self._store_cache(question, q_vec, answer_text, sources_meta)
 
         return {
             "answer": answer_text,
-            "sources": [{"source_file": r["source_file"], "source_ref": r["source_ref"],
-                         "similarity": r["similarity"]} for r in results],
+            "sources": sources_meta,
             "cache_hit": False,
             "latency_sec": latency,
         }

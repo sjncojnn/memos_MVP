@@ -55,10 +55,26 @@ CREATE TABLE IF NOT EXISTS qa_cache (
 CREATE TABLE IF NOT EXISTS ingest_log (
     id           TEXT PRIMARY KEY,
     source_file  TEXT NOT NULL,
-    status       TEXT NOT NULL,   -- inserted | exact_dup_skipped | near_dup_superseded | error
+    status       TEXT NOT NULL,   -- inserted | exact_dup_skipped | near_dup_conflict | error
     detail       TEXT,
     created_at   TEXT NOT NULL
 );
+
+-- Hàng đợi xung đột tri thức (Duplicate / Conflict Monitor).
+-- Khi ingest phát hiện near-duplicate, KHÔNG tự động supersede bản cũ nữa: cả hai bản
+-- (old_id, new_id) cùng ở trạng thái 'active' cho tới khi người dùng xử lý qua UI/API.
+CREATE TABLE IF NOT EXISTS conflicts (
+    id               TEXT PRIMARY KEY,
+    old_id           TEXT NOT NULL,
+    new_id           TEXT NOT NULL,
+    category         TEXT,
+    similarity       REAL,
+    conflict_type    TEXT NOT NULL DEFAULT 'near_duplicate',   -- near_duplicate | possible_conflict
+    conflict_status  TEXT NOT NULL DEFAULT 'open',             -- open | resolved_use_new | resolved_keep_old | ignored
+    created_at       TEXT NOT NULL,
+    resolved_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_conflict_status ON conflicts(conflict_status);
 """
 
 

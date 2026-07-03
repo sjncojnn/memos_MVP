@@ -10,21 +10,27 @@ Ví dụ:
     python cli.py tier --dry-run
     python cli.py stats
     python cli.py eval ./data_raw/golden_set.csv
+
+Chọn LLM backend khác Ollama (vd llama.cpp server, xem README mục 7) bằng --backend, LƯU Ý
+đặt TRƯỚC subcommand (giới hạn của argparse subparsers):
+    python cli.py --backend llamacpp ask "..."
 """
 import argparse
 import json
 import sys
 
 import db
-from ollama_client import OllamaClient
 from memory_api import MemoryStore
 from qa_service import QAService
+import client_factory
 import ingest
 import scheduler
 
 
 def main():
     ap = argparse.ArgumentParser(description="MemOS-lite MVP CLI")
+    ap.add_argument("--backend", choices=list(client_factory.BACKENDS), default=None,
+                     help="Chọn LLM backend: ollama (mặc định) hoặc llamacpp")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init-db", help="Khởi tạo database SQLite")
@@ -57,8 +63,8 @@ def main():
         print("OK - database initialized.")
         return
 
-    # các lệnh còn lại cần Ollama đang chạy
-    client = OllamaClient()
+    # các lệnh còn lại cần LLM backend đang chạy (Ollama hoặc llama.cpp server)
+    client = client_factory.get_client(backend=args.backend)
     store = MemoryStore(client)
 
     if args.cmd == "ingest-docs":

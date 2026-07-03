@@ -39,10 +39,12 @@ class MemoryStore:
         """
         Thêm 1 đơn vị tri thức. Có kiểm tra:
           - exact dedup theo content_hash (bỏ qua nếu đã tồn tại, còn active)
-          - near-dup theo cosine similarity trong cùng category (đánh dấu superseded bản cũ,
-            tăng version) -> đáp ứng "khử trùng lặp" + gợi ý quản lý phiên bản tri thức (mục 3 note)
-        Trả về dict {status, id} với status in
-          {inserted, exact_dup_skipped, near_dup_superseded}
+          - near-dup theo cosine similarity trong cùng category -> KHÔNG tự động
+            supersede; thay vào đó tạo 1 bản ghi trong bảng `conflicts` (status='open')
+            để người dùng tự xử lý (xem list_conflicts/resolve_conflict). Cả bản cũ và
+            bản mới vẫn 'active' cho tới khi conflict được xử lý.
+        Trả về dict {status, id, conflict_id} với status in
+          {inserted, exact_dup_skipped, near_dup_conflict}
         """
         content = content.strip()
         if not content:
@@ -67,7 +69,13 @@ class MemoryStore:
             embedding = self.client.embed(content)
 
             # near-duplicate check trong cùng category (giới hạn phạm vi so sánh cho gọn & nhanh)
-            superseded_id = None
+            # LƯU Ý: khác với bản trước, ở đây KHÔNG tự động supersede bản cũ nữa.
+            # Nếu phát hiện gần trùng, cả 2 bản (cũ + mới) vẫn 'active' song song, và một
+            # bản ghi conflict (status='open') được tạo để người dùng tự quyết định qua
+            # UI/API (xem list_conflicts / resolve_conflict) — đúng tinh thần "không tự động
+            # xóa/ẩn bản cũ nếu chưa cần" của quy trình conflict workflow.
+            conflict_old_id = None
+            conflict_sim = None
             rows = conn.execute(
                 "SELECT id, embedding FROM knowledge_units WHERE category=? AND status='active'",
                 (category,)
@@ -76,30 +84,36 @@ class MemoryStore:
             if candidates:
                 best = vs.top_k(embedding, candidates, k=1, min_sim=config.NEAR_DUP_THRESHOLD)
                 if best:
-                    superseded_id = best[0][0]
+                    conflict_old_id, conflict_sim = best[0]
 
             new_id = str(uuid.uuid4())
-            version = 1
-            if superseded_id:
-                old = conn.execute("SELECT version FROM knowledge_units WHERE id=?",
-                                    (superseded_id,)).fetchone()
-                version = (old["version"] if old else 1) + 1
-                conn.execute(
-                    "UPDATE knowledge_units SET status='superseded', superseded_by=?, updated_at=? "
-                    "WHERE id=?", (new_id, now, superseded_id)
-                )
-
             conn.execute(
                 "INSERT INTO knowledge_units (id, content, category, subcategory, source_file, "
                 "source_ref, content_hash, status, tier, version, created_at, updated_at, "
                 "access_count, ttl_expires_at, embedding) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (new_id, content, category, subcategory, source_file, source_ref, content_hash,
-                 "active", "warm", version, now, now, 0, ttl_expires_at,
+                 "active", "warm", 1, now, now, 0, ttl_expires_at,
                  vs.encode_embedding(embedding))
             )
-            status = "near_dup_superseded" if superseded_id else "inserted"
-            self._log(conn, source_file, status, f"id={new_id[:8]} version={version}")
-            return {"status": status, "id": new_id}
+
+            conflict_id = None
+            if conflict_old_id:
+                conflict_id = str(uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO conflicts (id, old_id, new_id, category, similarity, "
+                    "conflict_type, conflict_status, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (conflict_id, conflict_old_id, new_id, category, conflict_sim,
+                     "near_duplicate", "open", now)
+                )
+                status = "near_dup_conflict"
+            else:
+                status = "inserted"
+
+            detail = f"id={new_id[:8]}"
+            if conflict_old_id:
+                detail += f" conflict_with={conflict_old_id[:8]} sim={conflict_sim:.3f}"
+            self._log(conn, source_file, status, detail)
+            return {"status": status, "id": new_id, "conflict_id": conflict_id}
 
     # ------------------------------------------------------------- SEARCH
     def search(self, query: str, top_k: int = None, categories: list[str] = None,
@@ -208,6 +222,88 @@ class MemoryStore:
                 "by_tier": {r["tier"]: r["c"] for r in by_tier},
                 "by_category": {r["category"]: r["c"] for r in by_category},
             }
+
+    # ----------------------------------------------------------- CONFLICTS
+    def list_conflicts(self, status: str | None = "open") -> list[dict]:
+        """
+        Liệt kê conflict kèm nội dung 2 bên (old/new) để hiển thị trong UI.
+        status=None -> lấy tất cả trạng thái (open/resolved_use_new/resolved_keep_old/ignored).
+        """
+        with db.get_conn() as conn:
+            sql = (
+                "SELECT c.id, c.old_id, c.new_id, c.category, c.similarity, c.conflict_type, "
+                "c.conflict_status, c.created_at, c.resolved_at, "
+                "ou.content AS old_content, ou.source_file AS old_source_file, "
+                "ou.source_ref AS old_source_ref, ou.status AS old_status, ou.version AS old_version, "
+                "nu.content AS new_content, nu.source_file AS new_source_file, "
+                "nu.source_ref AS new_source_ref, nu.status AS new_status, nu.version AS new_version "
+                "FROM conflicts c "
+                "JOIN knowledge_units ou ON c.old_id = ou.id "
+                "JOIN knowledge_units nu ON c.new_id = nu.id"
+            )
+            params = []
+            if status:
+                sql += " WHERE c.conflict_status=?"
+                params.append(status)
+            sql += " ORDER BY c.created_at DESC"
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+
+    def resolve_conflict(self, conflict_id: str, resolution: str) -> dict:
+        """
+        Xử lý 1 conflict. resolution in {'use_new', 'keep_old', 'ignored'}:
+          - use_new  : bản mới thắng -> supersede bản cũ (bản cũ status='superseded'), version
+                       của bản mới += 1 kế thừa từ bản cũ.
+          - keep_old : bản cũ thắng -> bản mới bị supersede (status='superseded'), bản cũ giữ nguyên.
+          - ignored  : bỏ qua, giữ nguyên cả 2 bản 'active' song song (coi là không xung đột thật).
+        Không có bước LLM tự động giải quyết — luôn cần người dùng xác nhận.
+        """
+        valid = {"use_new", "keep_old", "ignored"}
+        if resolution not in valid:
+            return {"status": "error", "detail": f"resolution phải thuộc {sorted(valid)}"}
+        now = _now()
+        with db.get_conn() as conn:
+            row = conn.execute("SELECT * FROM conflicts WHERE id=?", (conflict_id,)).fetchone()
+            if not row:
+                return {"status": "not_found"}
+            if row["conflict_status"] != "open":
+                return {"status": "already_resolved", "conflict_status": row["conflict_status"]}
+
+            old_id, new_id = row["old_id"], row["new_id"]
+            if resolution == "use_new":
+                old_row = conn.execute("SELECT version FROM knowledge_units WHERE id=?",
+                                        (old_id,)).fetchone()
+                new_version = (old_row["version"] if old_row else 1) + 1
+                conn.execute(
+                    "UPDATE knowledge_units SET status='superseded', superseded_by=?, updated_at=? "
+                    "WHERE id=?", (new_id, now, old_id)
+                )
+                conn.execute(
+                    "UPDATE knowledge_units SET version=?, updated_at=? WHERE id=?",
+                    (new_version, now, new_id)
+                )
+                conflict_status = "resolved_use_new"
+            elif resolution == "keep_old":
+                conn.execute(
+                    "UPDATE knowledge_units SET status='superseded', superseded_by=?, updated_at=? "
+                    "WHERE id=?", (old_id, now, new_id)
+                )
+                conflict_status = "resolved_keep_old"
+            else:  # ignored
+                conflict_status = "ignored"
+
+            conn.execute(
+                "UPDATE conflicts SET conflict_status=?, resolved_at=? WHERE id=?",
+                (conflict_status, now, conflict_id)
+            )
+            return {"status": conflict_status, "conflict_id": conflict_id}
+
+    def conflict_stats(self) -> dict:
+        with db.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT conflict_status, COUNT(*) c FROM conflicts GROUP BY conflict_status"
+            ).fetchall()
+            return {r["conflict_status"]: r["c"] for r in rows}
 
     @staticmethod
     def _log(conn, source_file, status, detail):
