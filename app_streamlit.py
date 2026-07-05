@@ -4,17 +4,19 @@ Streamlit demo UI cho MemOS-lite MVP.
 Chạy:
     streamlit run app_streamlit.py
 
-6 tab theo yêu cầu demo:
+5 tab:
   1. Upload & Ingest                       -> ingest .docx/.xlsx từ UI, xem report
   2. Single QA Demo                        -> hỏi 1 câu, xem answer/sources/latency/cache
-  3. Repeated Question / Stable Reuse      -> hỏi lặp lại để thấy cache "ổn định" kích hoạt
-  4. Batch Questions                       -> upload CSV/XLSX câu hỏi, chạy hàng loạt, tải CSV
-  5. Memory Monitor                        -> thống kê kho tri thức + chạy phân tầng thủ công
-  6. Duplicate / Conflict Monitor          -> xử lý near-duplicate (use new / keep old / ignore)
+                                               (kèm hits/is_stable để thấy tiến trình cache
+                                               tích luỹ qua các lần hỏi thật, không cần tab
+                                               riêng ép hỏi lặp lại)
+  3. Batch Questions                       -> upload CSV/XLSX câu hỏi, chạy hàng loạt, tải CSV
+  4. Memory Monitor                        -> thống kê kho tri thức + QA cache + phân tầng
+  5. Duplicate / Conflict Monitor          -> xử lý near-duplicate (use new / keep old / ignore)
 
 Sidebar: chọn LLM backend (Ollama / llama.cpp), bật "Demo mode" để hạ nhanh
-STABLE_CACHE_MIN_HITS / HOT_ACCESS_THRESHOLD / NEAR_DUP_THRESHOLD giúp thấy hiệu ứng
-cache-hit & hot/cold tiering trong vài lượt hỏi thay vì phải đợi nhiều ngày.
+STABLE_CACHE_MIN_HITS / HOT_ACCESS_THRESHOLD / NEAR_DUP_THRESHOLD / QA_CACHE_MATCH_THRESHOLD
+giúp thấy hiệu ứng cache-hit & hot/cold tiering trong vài lượt hỏi thay vì phải đợi nhiều ngày.
 """
 import tempfile
 from pathlib import Path
@@ -113,9 +115,16 @@ if demo_mode:
         "STABLE_CACHE_MIN_HITS", min_value=1, max_value=5, value=2,
         help="Số lần hỏi trùng ý trước khi cache được coi là 'ổn định' (trả lời tắt, bỏ qua LLM).",
     )
+    config.QA_CACHE_MATCH_THRESHOLD = st.sidebar.slider(
+        "QA_CACHE_MATCH_THRESHOLD (cosine)", min_value=0.60, max_value=0.98, value=0.85, step=0.01,
+        help="Ngưỡng để coi 2 câu hỏi là CÙNG Ý ĐỊNH (kể cả diễn đạt khác nhau/đồng nghĩa) — "
+             "dùng để gộp hits vào cùng 1 cache row VÀ để trả lời tắt khi đã stable. Hạ thấp để "
+             "dễ nhận diện paraphrase hơn, nhưng quá thấp có thể gộp nhầm 2 ý định khác nhau.",
+    )
     config.HOT_ACCESS_THRESHOLD = st.sidebar.slider(
         "HOT_ACCESS_THRESHOLD", min_value=1, max_value=5, value=2,
-        help="access_count để 1 knowledge unit được lên tier 'hot' khi chạy phân tầng.",
+        help="access_count để 1 knowledge unit được lên tier 'hot' khi chạy phân tầng "
+             "(chỉ ảnh hưởng thứ tự ưu tiên retrieval, KHÔNG liên quan QA cache ở trên).",
     )
     config.NEAR_DUP_THRESHOLD = st.sidebar.slider(
         "NEAR_DUP_THRESHOLD (cosine)", min_value=0.80, max_value=0.99, value=0.90, step=0.01,
@@ -123,10 +132,12 @@ if demo_mode:
     )
 else:
     config.STABLE_CACHE_MIN_HITS = 3
+    config.QA_CACHE_MATCH_THRESHOLD = 0.85
     config.HOT_ACCESS_THRESHOLD = 5
     config.NEAR_DUP_THRESHOLD = 0.95
 st.sidebar.caption(
     f"Hiện tại: STABLE_CACHE_MIN_HITS={config.STABLE_CACHE_MIN_HITS} · "
+    f"QA_CACHE_MATCH_THRESHOLD={config.QA_CACHE_MATCH_THRESHOLD:.2f} · "
     f"HOT_ACCESS_THRESHOLD={config.HOT_ACCESS_THRESHOLD} · "
     f"NEAR_DUP_THRESHOLD={config.NEAR_DUP_THRESHOLD:.2f}"
 )
@@ -150,7 +161,6 @@ st.title("🧠 MemOS-lite — Demo quản lý bộ nhớ cho LLM")
 tabs = st.tabs([
     "📥 Upload & Ingest",
     "💬 Single QA Demo",
-    "🔁 Repeated Question",
     "📊 Batch Questions",
     "🗄️ Memory Monitor",
     "⚠️ Duplicate / Conflict Monitor",
@@ -229,85 +239,50 @@ with tabs[0]:
 # ============================================================== TAB 2: Single QA
 with tabs[1]:
     st.subheader("Hỏi 1 câu")
+    st.caption(
+        f"Mỗi câu hỏi/ý định (kể cả diễn đạt khác nhau, đồng nghĩa) được hỏi đủ "
+        f"{config.STABLE_CACHE_MIN_HITS} lần sẽ tự chuyển sang cache 'ổn định' — không cần "
+        "cố tình hỏi lặp lại y hệt, chỉ cần hỏi các câu hỏi thật của bạn như bình thường."
+    )
     question = st.text_input("Câu hỏi nghiệp vụ", key="single_qa_question",
                               placeholder="VD: Điều kiện vay tiền qua ViettelPay Pro là gì?")
     if st.button("Hỏi", type="primary", key="single_qa_btn", disabled=not question):
         with st.spinner("Đang xử lý..."):
             try:
                 result = qa.answer(question)
+                cache_info = qa.cache_info(question)
             except Exception as e:  # noqa: BLE001
                 st.error(f"Lỗi khi gọi LLM backend ({backend}): {e}")
-                result = None
+                result, cache_info = None, None
         if result:
             st.markdown("**Trả lời:**")
             st.write(result["answer"])
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             c1.metric("Cache hit", "✅ Có" if result["cache_hit"] else "❌ Không")
             c2.metric("Latency (s)", f"{result['latency_sec']:.3f}")
+            if cache_info:
+                c3.metric(
+                    "Tiến trình cache",
+                    f"{cache_info['hits']}/{config.STABLE_CACHE_MIN_HITS}"
+                    + (" (stable)" if cache_info["is_stable"] else ""),
+                )
+            else:
+                c3.metric("Tiến trình cache", "-")
+            st.caption(
+                "Lưu ý: nếu câu hỏi này khớp với 1 câu hỏi ĐÃ HỎI TRƯỚC ĐÓ nhưng diễn đạt khác "
+                "(vd đổi thứ tự từ, dùng từ đồng nghĩa) và độ tương đồng ngữ nghĩa đủ cao "
+                "(≥ QA_CACHE_MATCH_THRESHOLD ở sidebar), hits sẽ CỘNG DỒN vào cùng cache row đó "
+                "— hiển thị `hits` bên trên là của chính câu hỏi bạn vừa gõ (theo đúng nguyên "
+                "văn), có thể khác `hits` của cache row thực sự nếu bạn đổi cách diễn đạt."
+            )
             if result["sources"]:
                 st.markdown("**Nguồn tri thức đã dùng:**")
                 st.dataframe(pd.DataFrame(result["sources"]), use_container_width=True, hide_index=True)
             else:
                 st.caption("Không có nguồn tri thức nào được retrieve (có thể do kho tri thức trống).")
 
-# ============================================================== TAB 3: Repeated Question
+# ============================================================== TAB 3: Batch Questions
 with tabs[2]:
-    st.subheader("Hỏi lặp lại để xem cache 'ổn định' kích hoạt")
-    st.caption(
-        "Nhập cùng 1 câu hỏi (hoặc diễn đạt lại gần giống) và bấm 'Hỏi lại' nhiều lần. "
-        f"Sau {config.STABLE_CACHE_MIN_HITS} lượt hỏi trùng ý, cache chuyển sang 'stable' và các lượt "
-        "sau sẽ trả lời tức thì (cache_hit=True, không gọi LLM)."
-    )
-    repeat_q = st.text_input("Câu hỏi để lặp lại", key="repeat_question",
-                              placeholder="VD: Phí giao dịch chuyển tiền liên ngân hàng là bao nhiêu?")
-
-    if "repeat_history" not in st.session_state:
-        st.session_state["repeat_history"] = []
-
-    col_ask, col_clear = st.columns([1, 1])
-    if col_ask.button("🔁 Hỏi lại (mô phỏng lặp lại)", type="primary", disabled=not repeat_q):
-        with st.spinner("Đang xử lý..."):
-            try:
-                result = qa.answer(repeat_q)
-                cache_info = qa.cache_info(repeat_q)
-            except Exception as e:  # noqa: BLE001
-                st.error(f"Lỗi khi gọi LLM backend ({backend}): {e}")
-                result, cache_info = None, None
-        if result:
-            st.session_state["repeat_history"].append({
-                "lượt": len(st.session_state["repeat_history"]) + 1,
-                "question": repeat_q,
-                "cache_hit": result["cache_hit"],
-                "latency_sec": round(result["latency_sec"], 3),
-                "hits": cache_info["hits"] if cache_info else None,
-                "is_stable": bool(cache_info["is_stable"]) if cache_info else False,
-            })
-    if col_clear.button("Xoá lịch sử lượt hỏi (chỉ trong UI)"):
-        st.session_state["repeat_history"] = []
-
-    history = st.session_state["repeat_history"]
-    if history:
-        df_hist = pd.DataFrame(history)
-        st.dataframe(df_hist, use_container_width=True, hide_index=True)
-        st.markdown("**Latency theo từng lượt hỏi (giây):**")
-        st.line_chart(df_hist.set_index("lượt")["latency_sec"])
-        last = history[-1]
-        if last["is_stable"]:
-            st.success(
-                f"✅ Cache đã 'ổn định' (hits={last['hits']} ≥ {config.STABLE_CACHE_MIN_HITS}) — "
-                "các lượt hỏi tương tự tiếp theo sẽ được trả lời tức thì, bỏ qua LLM."
-            )
-        else:
-            hits = last["hits"] or 0
-            st.info(
-                f"Đang tích luỹ: {hits}/{config.STABLE_CACHE_MIN_HITS} lượt trùng ý. "
-                "Hỏi lại (đúng câu hoặc diễn đạt gần giống) để tiếp tục tích luỹ."
-            )
-    else:
-        st.caption("Chưa có lượt hỏi nào trong phiên này.")
-
-# ============================================================== TAB 4: Batch Questions
-with tabs[3]:
     st.subheader("Chạy hàng loạt câu hỏi từ file")
     st.caption("File CSV hoặc XLSX cần có cột tên 'question' (không phân biệt hoa/thường).")
     batch_file = st.file_uploader("Upload CSV/XLSX câu hỏi", type=["csv", "xlsx"], key="batch_uploader")
@@ -370,8 +345,8 @@ with tabs[3]:
                         file_name="batch_qa_results.csv", mime="text/csv",
                     )
 
-# ============================================================== TAB 5: Memory Monitor
-with tabs[4]:
+# ============================================================== TAB 4: Memory Monitor
+with tabs[3]:
     st.subheader("Thống kê kho tri thức")
     stats = store.stats()
     m1, m2 = st.columns(2)
@@ -385,7 +360,7 @@ with tabs[4]:
             [{"status": k, "count": v} for k, v in stats["by_status"].items()]
         ), use_container_width=True, hide_index=True)
     with c2:
-        st.markdown("**Theo tier (active)**")
+        st.markdown("**Theo tier (active)** — chỉ ảnh hưởng ưu tiên retrieval")
         df_tier = pd.DataFrame([{"tier": k, "count": v} for k, v in stats["by_tier"].items()])
         st.dataframe(df_tier, use_container_width=True, hide_index=True)
         if not df_tier.empty:
@@ -397,7 +372,28 @@ with tabs[4]:
         ), use_container_width=True, hide_index=True)
 
     st.divider()
-    st.subheader("Phân tầng nóng/lạnh & hết hạn TTL")
+    st.subheader("QA Cache (tầng riêng, độc lập với hot/cold tier ở trên)")
+    st.caption(
+        "Tier hot/warm/cold ở trên chỉ quyết định THỨ TỰ ƯU TIÊN RETRIEVAL. QA cache dưới đây "
+        "là tầng khác: bỏ qua HOÀN TOÀN việc gọi LLM khi 1 câu hỏi/ý định đã 'ổn định'."
+    )
+    cache_stats = qa.cache_stats()
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("Tổng số cache row", cache_stats["total"])
+    q2.metric("Đã ổn định (stable)", cache_stats["stable"])
+    q3.metric("Chưa ổn định", cache_stats["not_stable"])
+    q4.metric("Giới hạn (MAX_ITEMS)", cache_stats["max_items"] or "∞")
+    st.caption(
+        f"QA_CACHE_TTL_DAYS = {cache_stats['ttl_days'] or 'tắt'} — cache row không được hỏi lại "
+        "quá lâu sẽ tự bị dọn (xoá hẳn, không chỉ cold hoá)."
+    )
+    if st.button("🧹 Dọn QA cache ngay (áp dụng TTL + LRU budget)"):
+        result = qa.enforce_cache_limits_now()
+        st.success(f"Đã xoá {result['removed']} dòng, còn lại {result['remaining']}.")
+        st.rerun()
+
+    st.divider()
+    st.subheader("Phân tầng nóng/lạnh & hết hạn TTL (knowledge_units)")
     dry_run = st.checkbox("Dry-run (chỉ xem trước, không cập nhật DB)", value=True)
     if st.button("⚙️ Chạy phân tầng ngay", type="primary"):
         report = scheduler.run_tiering(dry_run=dry_run)
@@ -416,8 +412,8 @@ with tabs[4]:
     st.dataframe(pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame(),
                  use_container_width=True, hide_index=True)
 
-# ============================================================== TAB 6: Conflict Monitor
-with tabs[5]:
+# ============================================================== TAB 5: Conflict Monitor
+with tabs[4]:
     st.subheader("Duplicate / Conflict Monitor")
     st.caption(
         "Khi ingest phát hiện 2 đoạn tri thức gần giống nhau (near-duplicate), hệ thống KHÔNG tự "

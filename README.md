@@ -42,6 +42,12 @@ memos-mvp/
 ├── eval.py                 # EM/F1 + LLM-judge + báo cáo
 ├── cli.py                   # entrypoint CLI (xem mục 4)
 ├── app_streamlit.py          # Streamlit demo app (xem mục 6)
+├── baseline_db.py             # schema DB riêng cho RAG baseline (xem mục 8)
+├── baseline_store.py           # BaselineStore: add/search, KHÔNG dedup/tier/TTL/cache
+├── baseline_ingest.py           # ingest cho baseline, tái sử dụng parser từ ingest.py
+├── baseline_qa.py                 # BaselineQAService: retrieval + LLM ở mọi câu hỏi
+├── baseline_cli.py                 # CLI baseline song song với cli.py
+├── eval_compare.py                  # so sánh memos-mvp vs baseline trên cùng golden set
 ├── requirements.txt
 └── tests/
     ├── fake_ollama.py       # client giả lập để test KHÔNG cần Ollama server
@@ -57,7 +63,7 @@ brew install ollama
 ollama serve &                     # hoặc mở app Ollama
 
 # 2) Tải model (chọn model phù hợp cấu hình máy, càng nhỏ chạy CPU càng nhanh)
-ollama pull llama3.2:1b             # model chat — có thể đổi sang qwen2.5:3b/phi3.5 nếu máy yếu
+ollama pull llama3.2:3b             # model chat — có thể đổi sang qwen2.5:3b/phi3.5 nếu máy yếu
 ollama pull nomic-embed-text       # model embedding
 
 # 3) Cài Python deps
@@ -81,7 +87,7 @@ không phân biệt hoa/thường/dấu). `ingest.py` tự đoán category theo 
 ```bash
 python cli.py init-db
 python cli.py ingest-docs ./data_raw/tai_lieu_nghiep_vu
-python cli.py ingest-faq ./data_raw/FAQ.xlsx
+python cli.py ingest-faq ./data_raw/faq.xlsx
 python cli.py stats
 python cli.py ask "Điều kiện vay tiền qua ViettelPay Pro là gì?"
 python cli.py tier              # chạy phân tầng nóng/lạnh + TTL (nên đặt cron/launchd định kỳ)
@@ -127,26 +133,69 @@ pip install -r requirements.txt      # đã gồm streamlit, pandas
 streamlit run app_streamlit.py
 ```
 
-6 tab:
+5 tab:
 
 1. **Upload & Ingest** — upload trực tiếp `.docx`/`.xlsx` từ trình duyệt, xem report (inserted /
    exact_dup_skipped / near_dup_conflict / errors) + log ingest gần đây.
-2. **Single QA Demo** — hỏi 1 câu, xem trả lời, nguồn, `cache_hit`, latency.
-3. **Repeated Question / Stable Knowledge Reuse** — hỏi lặp lại (hoặc diễn đạt lại) 1 câu để
-   thấy cache chuyển từ "chưa ổn định" sang "ổn định" (`is_stable=1`) và latency giảm hẳn ở các
-   lượt sau, có biểu đồ latency theo từng lượt.
-4. **Batch Questions** — upload CSV/XLSX cột `question`, chạy hàng loạt qua `QAService`, xem bảng
+2. **Single QA Demo** — hỏi 1 câu, xem trả lời, nguồn, `cache_hit`, latency, và tiến trình
+   `hits/STABLE_CACHE_MIN_HITS` của chính câu hỏi đó. Không cần tab riêng để "ép" hỏi lặp lại —
+   hỏi các câu hỏi thật của bạn như bình thường, kể cả diễn đạt khác nhau cho cùng 1 ý định,
+   cache vẫn tự tích luỹ đúng (xem phần "QA cache" bên dưới).
+3. **Batch Questions** — upload CSV/XLSX cột `question`, chạy hàng loạt qua `QAService`, xem bảng
    `question / answer / sources / latency_sec / cache_hit / tier_used`, tải kết quả CSV.
-5. **Memory Monitor** — thống kê theo status/tier/category, chạy phân tầng nóng/lạnh + TTL thủ
-   công (có dry-run), xem log ghi vết nguồn gốc.
-6. **Duplicate / Conflict Monitor** — xử lý các near-duplicate đang chờ (xem mục 6-conflict bên
-   dưới): so sánh nội dung 2 bên, chọn "Dùng bản mới" / "Giữ bản cũ" / "Bỏ qua".
+4. **Memory Monitor** — thống kê theo status/tier/category, thống kê + dọn QA cache thủ công,
+   chạy phân tầng nóng/lạnh + TTL thủ công (có dry-run), xem log ghi vết nguồn gốc.
+5. **Duplicate / Conflict Monitor** — xử lý các near-duplicate đang chờ (xem phần "Conflict
+   workflow" bên dưới): so sánh nội dung 2 bên, chọn "Dùng bản mới" / "Giữ bản cũ" / "Bỏ qua".
 
-**Sidebar — Demo mode**: bật để hạ nhanh `STABLE_CACHE_MIN_HITS`, `HOT_ACCESS_THRESHOLD`,
-`NEAR_DUP_THRESHOLD` (mutate trực tiếp `config` module lúc runtime, không cần sửa file/khởi động
-lại) — giúp thấy hiệu ứng cache-hit / hot-tiering / conflict chỉ sau vài lượt tương tác thay vì
-phải đợi dữ liệu tích luỹ nhiều ngày. Sidebar cũng cho chọn LLM backend (Ollama / llama.cpp, xem
-mục 7) và nút xoá toàn bộ dữ liệu demo để chạy lại từ đầu.
+> Đã bỏ tab "Repeated Question" từng có ở bản trước: ép người dùng gõ lại đúng 1 câu nhiều lần
+> không phản ánh cách dùng thật, và (cùng với 1 bug đã sửa — xem "QA cache" bên dưới) khiến hành
+> vi cache trông "khác nhau" một cách khó hiểu giữa các tab dù chạy chung 1 hàm `QAService.answer()`.
+> Giờ Single QA đã tự hiển thị tiến trình `hits/is_stable`, không cần tab riêng.
+
+**Sidebar — Demo mode**: bật để hạ nhanh `STABLE_CACHE_MIN_HITS`, `QA_CACHE_MATCH_THRESHOLD`,
+`HOT_ACCESS_THRESHOLD`, `NEAR_DUP_THRESHOLD` (mutate trực tiếp `config` module lúc runtime, không
+cần sửa file/khởi động lại) — giúp thấy hiệu ứng cache-hit / hot-tiering / conflict chỉ sau vài
+lượt tương tác thay vì phải đợi dữ liệu tích luỹ nhiều ngày. Sidebar cũng cho chọn LLM backend
+(Ollama / llama.cpp, xem mục 7) và nút xoá toàn bộ dữ liệu demo để chạy lại từ đầu.
+
+### QA cache: sửa lỗi cache-poisoning + nhận diện câu hỏi đồng nghĩa + budget
+
+Bản trước có 1 bug ở `qa_service.py`: bước tìm cache dùng `min_sim=0.0`, nghĩa là **luôn** trả
+về "ứng viên gần nhất" trong `qa_cache` dù độ tương đồng thực tế rất thấp (câu hỏi hoàn toàn
+không liên quan). Hệ quả:
+
+- 1 câu hỏi mới, không liên quan gì, vẫn bị gộp vào 1 cache row cũ ngẫu nhiên → cộng nhầm
+  `hits`, ghi đè `answer`/`sources` sai vào cache row đó.
+- Vì hành vi phụ thuộc vào **cache đang có sẵn trong DB tại thời điểm hỏi** (tức phụ thuộc thứ
+  tự/lịch sử các câu đã hỏi trước đó), cùng 1 câu hỏi có thể "cache_hit" ở tab này nhưng không ở
+  tab khác — dù cả 2 tab gọi chung 1 hàm `QAService.answer()`. Đây chính là nguyên nhân của hiện
+  tượng "không nhất quán giữa Single QA/Batch/Repeated Question" đã quan sát thấy.
+
+**Đã sửa** bằng 1 ngưỡng thật sự — `config.QA_CACHE_MATCH_THRESHOLD` (mặc định `0.85`, thay cho
+`STABLE_CACHE_SIM_THRESHOLD=0.92` cũ bị dùng sai chỗ):
+
+- `_find_cache_hit()` giờ chỉ coi là "khớp" khi cosine similarity ≥ `QA_CACHE_MATCH_THRESHOLD`;
+  nếu không có ứng viên nào đạt ngưỡng, trả về `None` (tạo cache row **mới**) thay vì luôn nhận
+  bừa 1 row không liên quan.
+- Ngưỡng này cũng chính là cách hệ thống nhận diện 2 câu hỏi **đồng nghĩa/cùng ý định dù khác
+  cách diễn đạt** — ví dụ "ai là chủ giao dịch mua bảo hiểm trên viettel pay pro?" và "người lập
+  giao dịch mua bảo hiểm trên ViettelPay Pro là ai?" sẽ được gộp vào **cùng 1 cache row** nếu
+  embedding model đủ tốt về ngữ nghĩa (đã kiểm chứng bằng test nội bộ với embedding mô phỏng ý
+  định — xem `answer()` trong `qa_service.py` để hiểu 3 nhánh: stable-hit / merge-vào-đúng-row /
+  tạo-row-mới). Nếu dùng embedding kém về ngữ nghĩa (vd hash/lexical thuần), cần đo lại và có thể
+  phải hạ ngưỡng — chỉnh trực tiếp qua sidebar demo mode để thử nhanh.
+- Budget/vòng đời cho `qa_cache` (trước đây phình vô hạn): `config.QA_CACHE_MAX_ITEMS` (mặc định
+  500, LRU theo `last_hit_at` khi vượt) và `config.QA_CACHE_TTL_DAYS` (mặc định 30 ngày, xoá hẳn
+  — không chỉ cold hoá như `knowledge_units`). Áp dụng tự động sau mỗi lần tạo cache row mới; có
+  thể dọn thủ công qua nút trong tab Memory Monitor hoặc `QAService.enforce_cache_limits_now()`.
+
+**Hot/cold tier vs QA cache — 2 tầng tách biệt, không dùng chung ngưỡng/điều kiện:**
+
+| Tầng | Vai trò | Ảnh hưởng |
+|---|---|---|
+| `tier` (hot/warm/cold) trên `knowledge_units` | Ưu tiên trong `MemoryStore.search()` | Item `cold` bị loại khỏi kết quả trừ khi không đủ ứng viên hot/warm (fallback) |
+| `qa_cache` (`hits`, `is_stable`) | Bỏ qua HOÀN TOÀN retrieval + gọi LLM khi 1 ý định đã ổn định | Không đọc/ghi gì tới `tier`; hoạt động ở mức câu hỏi, không phải mức tri thức |
 
 ### Conflict workflow (near-duplicate)
 
@@ -214,7 +263,65 @@ sửa nhanh nếu bạn tách 2 tiến trình).
   cache sẵn có trong `qa_service.py` — không có gì bị gãy, chỉ là không tận dụng được prefix-cache
   ở tầng thấp.
 
-## 8. Giới hạn đã biết / phạm vi ngoài giai đoạn 1
+## 8. RAG baseline để so sánh
+
+Để đo đúng giá trị gia tăng của phần "quản lý bộ nhớ" (mục 5 Problem Statement: "vượt baseline
+truy hồi tri thức thông thường"), repo có thêm 1 **RAG baseline tối giản** — mô phỏng cách làm
+RAG "thông thường" không có quản lý vòng đời/dedup/cache:
+
+```
+baseline_db.py       # schema tối giản: 1 bảng `chunks` phẳng (không status/tier/version/TTL)
+baseline_store.py     # BaselineStore: add_chunk() KHÔNG dedup, search() KHÔNG phân tầng hot/cold
+baseline_ingest.py     # tái sử dụng parse_docx/parse_faq_xlsx/guess_category từ ingest.py
+baseline_qa.py           # BaselineQAService: retrieval + gọi LLM ở MỌI câu hỏi, không cache
+baseline_cli.py           # CLI song song với cli.py (init-db/ingest-docs/ingest-faq/ask/stats/eval)
+eval_compare.py            # chạy memos-mvp + baseline trên CÙNG golden set, in bảng so sánh
+```
+
+**Baseline khác memos-mvp CHÍNH XÁC ở những điểm memos-mvp bổ sung** (để phép so sánh phản ánh
+đúng giá trị của phần quản lý bộ nhớ, không phải khác biệt ngẫu nhiên khác):
+
+| | memos-mvp | RAG baseline |
+|---|---|---|
+| Dedup | exact-hash + near-dup → conflict queue | **Không có** — ingest lại vẫn thêm y hệt |
+| Hot/cold tier | Có, ưu tiên retrieval | **Không có** — mọi chunk bình đẳng |
+| Vòng đời / TTL | Có (`expired`, `cold`) | **Không có** — chunk tồn tại vĩnh viễn |
+| QA cache (bỏ qua LLM khi ổn định) | Có (`qa_cache`, `is_stable`) | **Không có** — luôn retrieval + gọi LLM |
+| Ghi vết nguồn gốc | Có (`ingest_log`, `source_file/ref`) | Có (giữ để so sánh log ingest công bằng) |
+
+**Cố tình giữ GIỐNG NHAU** để biến số duy nhất là "có/không có quản lý bộ nhớ": cùng
+`client_factory.py` (cùng LLM backend/model — Ollama hoặc llama.cpp), cùng hàm parse/chunk/clean
+từ `ingest.py`, cùng `vector_store.py` (cosine similarity), cùng `config.TOP_K` /
+`config.SIM_THRESHOLD_MIN`, và `BaselineQAService.answer()` trả về **cùng shape dict**
+(`answer, sources, cache_hit, latency_sec`) với `QAService.answer()` nên có thể tái sử dụng
+nguyên `eval.run_eval()` — đảm bảo EM/F1/LLM-judge được tính bằng đúng 1 công thức cho cả 2 phía.
+
+### Chạy so sánh
+
+```bash
+# 1. Ingest CÙNG 1 bộ dữ liệu thô vào cả 2 hệ thống (DB tách biệt: data/memos.db vs data/baseline.db)
+python cli.py ingest-docs ./data_raw/tai_lieu_nghiep_vu
+python cli.py ingest-faq ./data_raw/faq.xlsx
+python baseline_cli.py ingest-docs ./data_raw/tai_lieu_nghiep_vu
+python baseline_cli.py ingest-faq ./data_raw/faq.xlsx
+
+# 2. Chạy so sánh trên bộ đánh giá vàng (cùng --backend cho cả 2 phía)
+python eval_compare.py ./data_raw/golden_set.csv
+# hoặc: python eval_compare.py ./data_raw/golden_set.csv --backend llamacpp --no-judge
+```
+
+Kết quả in ra bảng so sánh `EM / F1 / LLM_judge_avg_1_5 / avg_latency_cache_miss_sec /
+avg_latency_cache_hit_sec / cache_hit_rate` cho cả 2 hệ thống, kèm 2 file chi tiết
+(`eval_results_memos.csv`, `eval_results_baseline.csv`). Vì baseline không có QA cache,
+`avg_latency_cache_hit_sec`/`cache_hit_rate` của baseline luôn rỗng/0 — bản thân sự khác biệt
+này (memos-mvp có thể trả lời tắt sau khi "ổn định", baseline thì không bao giờ) chính là 1 phần
+kết quả cần trình bày cho mục "Hiệu năng" (mục 5 Problem Statement).
+
+Cũng có thể chạy từng lệnh baseline riêng lẻ giống hệt cú pháp `cli.py`:
+`python baseline_cli.py ask "..."`, `python baseline_cli.py stats`,
+`python baseline_cli.py eval ./data_raw/golden_set.csv`.
+
+## 9. Giới hạn đã biết / phạm vi ngoài giai đoạn 1
 
 - Hot/cold dựa trên luật đơn giản (access_count + thời gian), không dùng ML — đúng tinh thần
   "đơn giản" nhưng kém chính xác hơn nếu truy vấn dồn dập trong thời gian ngắn thay vì rải đều.
