@@ -3,7 +3,7 @@ Client tối giản gọi Ollama local qua REST API (http://localhost:11434).
 Không phụ thuộc SDK ngoài — chỉ dùng `requests` để dễ cài đặt trên macOS.
 
 Yêu cầu trước khi chạy thật:
-    ollama pull qwen2.5:7b        # hoặc model chat khác nhẹ hơn/nặng hơn tuỳ máy
+    ollama pull llama3.2:3b       # hoặc model chat khác nhẹ hơn/nặng hơn tuỳ máy
     ollama pull nomic-embed-text  # model embedding
 
 Có STABLE system prompt cố định (SYSTEM_PROMPT) để tận dụng cơ chế cache prefix

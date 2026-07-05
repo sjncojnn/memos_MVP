@@ -57,7 +57,7 @@ brew install ollama
 ollama serve &                     # hoặc mở app Ollama
 
 # 2) Tải model (chọn model phù hợp cấu hình máy, càng nhỏ chạy CPU càng nhanh)
-ollama pull qwen2.5:7b             # model chat — có thể đổi sang qwen2.5:3b/phi3.5 nếu máy yếu
+ollama pull llama3.2:1b             # model chat — có thể đổi sang qwen2.5:3b/phi3.5 nếu máy yếu
 ollama pull nomic-embed-text       # model embedding
 
 # 3) Cài Python deps
@@ -81,7 +81,7 @@ không phân biệt hoa/thường/dấu). `ingest.py` tự đoán category theo 
 ```bash
 python cli.py init-db
 python cli.py ingest-docs ./data_raw/tai_lieu_nghiep_vu
-python cli.py ingest-faq ./data_raw/faq.xlsx
+python cli.py ingest-faq ./data_raw/FAQ.xlsx
 python cli.py stats
 python cli.py ask "Điều kiện vay tiền qua ViettelPay Pro là gì?"
 python cli.py tier              # chạy phân tầng nóng/lạnh + TTL (nên đặt cron/launchd định kỳ)

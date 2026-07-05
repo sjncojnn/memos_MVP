@@ -111,15 +111,31 @@ def parse_docx(path: Path) -> list[dict]:
             current_paras.append(text)
     flush()
 
-    # bảng trong docx (nếu có) -> mỗi bảng thành 1 chunk dạng text có cấu trúc
+    # # bảng trong docx (nếu có) -> mỗi bảng thành 1 chunk dạng text có cấu trúc
+    # for ti, table in enumerate(doc.tables):
+    #     rows_text = []
+    #     for row in table.rows:
+    #         cells = [c.text.strip() for c in row.cells]
+    #         if any(cells):
+    #             rows_text.append(" | ".join(cells))
+    #     if rows_text:
+    #         sections.append({"content": "\n".join(rows_text), "source_ref": f"Bảng {ti + 1}"})
+    
+    # bảng trong docx (nếu có) -> chunk theo từng phần, tránh bảng quá dài làm lỗi embedding
     for ti, table in enumerate(doc.tables):
         rows_text = []
         for row in table.rows:
-            cells = [c.text.strip() for c in row.cells]
+            cells = [clean_text(c.text.strip()) for c in row.cells]
             if any(cells):
                 rows_text.append(" | ".join(cells))
+
         if rows_text:
-            sections.append({"content": "\n".join(rows_text), "source_ref": f"Bảng {ti + 1}"})
+            table_chunks = chunk_text(rows_text)
+            for ci, chunk in enumerate(table_chunks, start=1):
+                sections.append({
+                    "content": chunk,
+                    "source_ref": f"Bảng {ti + 1} / phần {ci}"
+                })
 
     return sections
 

@@ -13,8 +13,8 @@ DB_PATH = os.environ.get("MEMOS_DB_PATH", str(DATA_DIR / "memos.db"))
 
 # ---- Ollama ----
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-# Model chat: nên chọn model nhỏ chạy được CPU trên macOS, vd qwen2.5:7b, llama3.1:8b, phi3.5
-CHAT_MODEL = os.environ.get("MEMOS_CHAT_MODEL", "qwen2.5:7b")
+# Model chat: nên chọn model nhỏ chạy được CPU trên macOS, mặc định dùng Llama3.2:3B
+CHAT_MODEL = os.environ.get("MEMOS_CHAT_MODEL", "llama3.2:3b")
 # Model embedding: nomic-embed-text nhẹ, chạy tốt trên CPU
 EMBED_MODEL = os.environ.get("MEMOS_EMBED_MODEL", "nomic-embed-text")
 EMBED_DIM = int(os.environ.get("MEMOS_EMBED_DIM", "768"))  # nomic-embed-text = 768
